@@ -1,0 +1,12 @@
+# Node.js/Frontend
+node_modules/
+dist/
+build/
+*.log
+.env
+
+# Backend
+server/node_modules/
+server/dist/
+server/*.log
+server/.env
