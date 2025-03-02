@@ -41,12 +41,13 @@ const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
 const userSchema = new mongoose.Schema({
   username: String,
   password: String,
-  role: { type: String, enum: ['organizer', 'player', 'spectator'], default: 'player' },
+  role: { type: String, enum: ['organizer', 'player', 'spectator', 'moderator'], default: 'player' },
   email: String,
   games: [String],
   tournaments: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Tournament' }],
   teams: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Team' }],
   elo: { type: Number, default: 1000 },
+  donations: [{ tournamentId: { type: mongoose.Schema.Types.ObjectId, ref: 'Tournament' }, amount: Number }],
 });
 const User = mongoose.model('User', userSchema);
 
@@ -99,11 +100,11 @@ const tournamentSchema = new mongoose.Schema({
   crowdfunding_goal: Number,
   stretch_goals: [{ description: String, amount: Number }],
   uploads: [{ fileId: mongoose.Types.ObjectId, filename: String }],
-  messages: [{ user: String, text: String, type: { type: String, default: 'discussion' }, timestamp: { type: Date, default: Date.now } }],
+  messages: [{ user: String, text: String, type: { type: String, default: 'discussion' }, timestamp: { type: Date, default: Date.now }, parentId: String }],
   stream_url: String,
   sponsors: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Sponsor' }],
   bracket: {
-    type: { type: String, enum: ['single_elimination', 'double_elimination', 'round_robin'] },
+    type: { type: String, enum: ['single_elimination', 'double_elimination', 'round_robin'], default: 'single_elimination' },
     rounds: [[{ player1: String, player2: String, winner: String, date: Date, seed1: Number, seed2: Number, status: String }]],
     winners: [[{ player1: String, player2: String, winner: String, date: Date, seed1: Number, seed2: Number, status: String }]],
     losers: [[{ player1: String, player2: String, winner: String, date: Date, seed1: Number, seed2: Number, status: String }]],
@@ -128,7 +129,7 @@ async function initializeDefaultData() {
       password: hashedPassword,
       role: 'organizer',
       email: 'admin@example.com',
-      games: [],
+      games: ['Rocket League'],
       tournaments: [],
       teams: [],
     });
@@ -141,7 +142,7 @@ async function initializeDefaultData() {
       password: bcrypt.hashSync('pass123', 10),
       role: 'player',
       email: `${username}@example.com`,
-      games: [],
+      games: ['Rocket League'],
       tournaments: [],
       teams: [],
     }));
@@ -210,7 +211,7 @@ const authenticateToken = (req, res, next) => {
   if (!token) return res.status(401).json({ error: 'Access denied' });
   try {
     req.user = jwt.verify(token, JWT_SECRET);
-    if (!['organizer', 'player', 'spectator'].includes(req.user.role)) return res.status(403).json({ error: 'Invalid role' });
+    if (!['organizer', 'player', 'spectator', 'moderator'].includes(req.user.role)) return res.status(403).json({ error: 'Invalid role' });
     next();
   } catch (err) {
     res.status(403).json({ error: 'Invalid token' });
@@ -221,7 +222,7 @@ const authenticateToken = (req, res, next) => {
 app.post('/register', async (req, res) => {
   try {
     const { username, password, email, role = 'player' } = req.body;
-    if (!['organizer', 'player', 'spectator'].includes(role)) return res.status(400).json({ error: 'Invalid role' });
+    if (!['organizer', 'player', 'spectator', 'moderator'].includes(role)) return res.status(400).json({ error: 'Invalid role' });
     const hashedPassword = await bcrypt.hash(password, 10);
     const user = new User({ username, password: hashedPassword, role, email, games: [], tournaments: [], teams: [] });
     await user.save();
@@ -236,7 +237,7 @@ app.post('/login', async (req, res) => {
     const { username, password } = req.body;
     const user = await User.findOne({ username });
     if (!user || !await bcrypt.compare(password, user.password)) return res.status(401).json({ error: 'Invalid credentials' });
-    const token = jwt.sign({ id: user._id, username: user.username, role: user.role }, JWT_SECRET, { expiresIn: '7d' }); // Updated to 7 days
+    const token = jwt.sign({ id: user._id, username: user.username, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
     res.json({ token });
   } catch (err) {
     res.status(500).json({ error: 'Login failed' });
@@ -244,7 +245,7 @@ app.post('/login', async (req, res) => {
 });
 
 app.get('/user/role', authenticateToken, (req, res) => {
-  res.json({ role: req.user.role });
+  res.json({ role: req.user.role, username: req.user.username });
 });
 
 // Tournament Routes
@@ -261,11 +262,11 @@ app.get('/tournaments', authenticateToken, async (req, res) => {
 app.post('/tournaments', authenticateToken, async (req, res) => {
   try {
     if (req.user.role !== 'organizer') return res.status(403).json({ error: 'Organizers only' });
-    const { name, game, start_date, is_team_based, crowdfunding_goal, prize_pool, prize_distribution, stream_url, bracket_type = 'single_elimination' } = req.body;
+    const { name, game, start_date, is_team_based, crowdfunding_goal, prize_pool, stream_url, bracket_type = 'single_elimination' } = req.body;
     const tournament = new Tournament({
       name,
       game,
-      start_date,
+      start_date: new Date(start_date),
       status: 'upcoming',
       organizer: req.user.username,
       is_team_based,
@@ -273,7 +274,7 @@ app.post('/tournaments', authenticateToken, async (req, res) => {
       active_teams: [],
       current_funds: 0,
       prize_pool,
-      prize_distribution,
+      prize_distribution: [{ rank: 1, amount: prize_pool * 0.6 }, { rank: 2, amount: prize_pool * 0.3 }, { rank: 3, amount: prize_pool * 0.1 }],
       crowdfunding_goal,
       stretch_goals: [],
       uploads: [],
@@ -287,6 +288,7 @@ app.post('/tournaments', authenticateToken, async (req, res) => {
     const user = await User.findById(req.user.id);
     user.tournaments.push(tournament._id);
     await user.save();
+    io.emit('tournamentUpdate', tournament);
     res.status(201).json(tournament);
   } catch (err) {
     res.status(500).json({ error: 'Failed to create tournament' });
@@ -299,6 +301,7 @@ app.put('/tournaments/:id', authenticateToken, async (req, res) => {
     const updates = req.body;
     const tournament = await Tournament.findByIdAndUpdate(id, updates, { new: true });
     if (!tournament || (req.user.role !== 'organizer' && tournament.organizer !== req.user.username)) return res.status(404).json({ error: 'Tournament not found or unauthorized' });
+    io.emit('tournamentUpdate', tournament);
     res.json(tournament);
   } catch (err) {
     res.status(500).json({ error: 'Failed to update tournament' });
@@ -321,6 +324,7 @@ app.post('/tournaments/:id/register', authenticateToken, async (req, res) => {
       }
     }
     await tournament.save();
+    io.emit('tournamentUpdate', tournament);
     res.json(tournament);
   } catch (err) {
     res.status(500).json({ error: 'Registration failed' });
@@ -332,8 +336,14 @@ app.post('/tournaments/:id/donate', authenticateToken, async (req, res) => {
     const { id } = req.params;
     const { amount } = req.body;
     const tournament = await Tournament.findById(id);
+    if (!tournament) return res.status(404).json({ error: 'Tournament not found' });
     tournament.current_funds += Number(amount);
     await tournament.save();
+    const user = await User.findById(req.user.id);
+    user.donations.push({ tournamentId: id, amount: Number(amount) });
+    await user.save();
+    io.emit('tournamentUpdate', tournament);
+    io.emit('donate', { tournamentId: id, amount });
     res.json(tournament);
   } catch (err) {
     res.status(500).json({ error: 'Donation failed' });
@@ -343,14 +353,34 @@ app.post('/tournaments/:id/donate', authenticateToken, async (req, res) => {
 app.post('/tournaments/:id/messages', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
-    const { text, type } = req.body;
+    const { text, type, parentId } = req.body;
     const tournament = await Tournament.findById(id);
-    tournament.messages.push({ user: req.user.username, text, type });
+    tournament.messages.push({ user: req.user.username, text, type, timestamp: new Date(), parentId });
     await tournament.save();
-    io.emit('messageUpdate', tournament);
+    io.emit('messageUpdate', { _id: id, messages: tournament.messages });
     res.json(tournament);
   } catch (err) {
     res.status(500).json({ error: 'Message failed' });
+  }
+});
+
+app.put('/tournaments/:id/messages/:messageId', authenticateToken, async (req, res) => {
+  try {
+    const { id, messageId } = req.params;
+    const { action } = req.body;
+    const tournament = await Tournament.findById(id);
+    if (!tournament) return res.status(404).json({ error: 'Tournament not found' });
+    if (req.user.role !== 'organizer' && req.user.role !== 'moderator') return res.status(403).json({ error: 'Moderators or organizers only' });
+    if (action === 'delete') {
+      tournament.messages = tournament.messages.filter(m => m._id.toString() !== messageId);
+    } else if (action === 'pin') {
+      tournament.messages = tournament.messages.map(m => m._id.toString() === messageId ? { ...m, pinned: true } : m);
+    }
+    await tournament.save();
+    io.emit('messageUpdate', { _id: id, messages: tournament.messages });
+    res.json(tournament);
+  } catch (err) {
+    res.status(500).json({ error: 'Moderation failed' });
   }
 });
 
@@ -360,6 +390,7 @@ app.post('/tournaments/:id/upload', authenticateToken, upload.single('file'), as
     const tournament = await Tournament.findById(id);
     tournament.uploads.push({ fileId: req.file.id, filename: req.file.filename });
     await tournament.save();
+    io.emit('tournamentUpdate', tournament);
     res.json(tournament);
   } catch (err) {
     res.status(500).json({ error: 'Upload failed' });
@@ -394,7 +425,7 @@ app.post('/tournaments/:id/bracket', authenticateToken, async (req, res) => {
       }
     }
     await tournament.save();
-    io.emit('bracketUpdate', tournament);
+    io.emit('bracketUpdate', { _id: id, bracket: tournament.bracket });
     res.json(tournament);
   } catch (err) {
     res.status(500).json({ error: 'Bracket update failed' });
@@ -409,6 +440,7 @@ app.post('/tournaments/:id/seed', authenticateToken, async (req, res) => {
     if (!team) return res.status(404).json({ error: 'Team not found' });
     team.seed = seed;
     await team.save();
+    io.emit('teamUpdate', team);
     res.json(team);
   } catch (err) {
     res.status(500).json({ error: 'Seeding failed' });
@@ -423,7 +455,7 @@ app.post('/tournaments/:id/schedule', authenticateToken, async (req, res) => {
     if (!tournament) return res.status(404).json({ error: 'Tournament not found' });
     tournament.schedule.push({ matchId, time: new Date(time), location, reminderSent: false });
     await tournament.save();
-    io.emit('scheduleUpdate', tournament);
+    io.emit('scheduleUpdate', { _id: id, schedule: tournament.schedule });
     res.json(tournament);
   } catch (err) {
     res.status(500).json({ error: 'Schedule update failed' });
@@ -446,9 +478,24 @@ app.post('/tournaments/:id/sponsors', authenticateToken, upload.single('logo'), 
     await sponsor.save();
     tournament.sponsors.push(sponsor._id);
     await tournament.save();
+    io.emit('tournamentUpdate', tournament);
     res.status(201).json(sponsor);
   } catch (err) {
     res.status(500).json({ error: 'Sponsor creation failed' });
+  }
+});
+
+app.put('/tournaments/:id/sponsors/:sponsorId', authenticateToken, async (req, res) => {
+  try {
+    const { id, sponsorId } = req.params;
+    const updates = req.body;
+    const sponsor = await Sponsor.findByIdAndUpdate(sponsorId, updates, { new: true });
+    if (!sponsor || sponsor.tournamentId.toString() !== id) return res.status(404).json({ error: 'Sponsor not found or unauthorized' });
+    const tournament = await Tournament.findById(id);
+    io.emit('tournamentUpdate', tournament);
+    res.json(sponsor);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update sponsor' });
   }
 });
 
@@ -480,6 +527,7 @@ app.post('/teams', authenticateToken, async (req, res) => {
     members.forEach(m => m.teams.push(team._id));
     await captain.save();
     await Promise.all(members.map(m => m.save()));
+    io.emit('teamUpdate', team);
     res.status(201).json(team);
   } catch (err) {
     res.status(500).json({ error: 'Failed to create team' });
@@ -499,6 +547,7 @@ app.put('/teams/:id', authenticateToken, async (req, res) => {
     }
     if (roles) team.roles = roles.map(r => ({ member: r.member, role: r.role }));
     await team.save();
+    io.emit('teamUpdate', team);
     res.json(team);
   } catch (err) {
     res.status(500).json({ error: 'Failed to update team' });
@@ -524,7 +573,7 @@ app.post('/tournaments/:id/page', authenticateToken, upload.fields([{ name: 'ban
     if (!tournament || (req.user.role !== 'organizer' && tournament.organizer !== req.user.username)) return res.status(404).json({ error: 'Tournament not found or unauthorized' });
     let page = await Page.findOne({ tournamentId: id });
     const bannerImage = req.files['bannerImage'] ? { fileId: req.files['bannerImage'][0].id, filename: req.files['bannerImage'][0].filename } : page?.bannerImage;
-    const parsedSections = JSON.parse(sections).map((s, i) => ({
+    const parsedSections = JSON.parse(sections || '[]').map((s, i) => ({
       type: s.type,
       content: s.content,
       image: req.files['sectionImages'] && req.files['sectionImages'][i] ? { fileId: req.files['sectionImages'][i].id, filename: req.files['sectionImages'][i].filename } : s.image,
@@ -548,13 +597,14 @@ app.post('/tournaments/:id/page', authenticateToken, upload.fields([{ name: 'ban
       });
     }
     await page.save();
+    io.emit('tournamentUpdate', tournament); // Notify of page update
     res.json(page);
   } catch (err) {
     res.status(500).json({ error: 'Failed to save page' });
   }
 });
 
-// Public Routes (for future public site)
+// Public Routes
 app.get('/public/tournaments', async (req, res) => {
   try {
     const tournaments = await Tournament.find({ status: { $in: ['upcoming', 'ongoing'] } }).populate('active_teams sponsors');
@@ -602,6 +652,8 @@ app.put('/tournaments/:id/sponsors/:sponsorId', authenticateToken, async (req, r
     const updates = req.body;
     const sponsor = await Sponsor.findByIdAndUpdate(sponsorId, updates, { new: true });
     if (!sponsor || sponsor.tournamentId.toString() !== id) return res.status(404).json({ error: 'Sponsor not found or unauthorized' });
+    const tournament = await Tournament.findById(id);
+    io.emit('tournamentUpdate', tournament);
     res.json(sponsor);
   } catch (err) {
     res.status(500).json({ error: 'Failed to update sponsor' });
@@ -620,10 +672,11 @@ app.get('/tournaments/:id/analytics', authenticateToken, async (req, res) => {
       prizePool: tournament.prize_pool,
       matchesPlayed: tournament.stats.completedMatches,
       totalMatches: tournament.stats.totalMatches,
-      engagement: tournament.stats.participantEngagement,
+      engagement: tournament.stats.participantEngagement || 0,
       sponsors: tournament.sponsors.length,
       messages: tournament.messages.length,
       uploads: tournament.uploads.length,
+      donorCount: await User.countDocuments({ donations: { $elemMatch: { tournamentId: id } } }),
     };
     res.json(analytics);
   } catch (err) {
@@ -633,8 +686,15 @@ app.get('/tournaments/:id/analytics', authenticateToken, async (req, res) => {
 
 const server = http.createServer(app);
 const io = socketIo(server, { 
-  cors: { origin: ['http://localhost:3000', 'http://localhost:3002'] },
-  transports: ['websocket', 'polling'], // Ensure both WebSocket and polling are supported
+  cors: { 
+    origin: ['http://localhost:3000', 'http://localhost:3002'], 
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'], 
+    allowedHeaders: ['Authorization', 'Content-Type'], 
+    credentials: true,
+  },
+  transports: ['websocket', 'polling'], 
+  pingTimeout: 60000, 
+  pingInterval: 25000,
 });
 
 io.on('connection', (socket) => {
@@ -644,42 +704,73 @@ io.on('connection', (socket) => {
     console.log('Client disconnected:', socket.id, 'Reason:', reason);
   });
 
-  // Handle real-time updates with connection testing
   socket.on('connectionTest', (data) => {
     console.log('Frontend connection test received:', data.message);
     socket.emit('connectionTestResponse', { message: 'Backend confirmed connection' });
   });
 
-  socket.on('tournamentUpdate', (data) => {
+  socket.on('fetchInitialData', async () => {
+    const tournaments = await Tournament.find().populate('active_teams sponsors');
+    const teams = await Team.find().populate('captain members');
+    socket.emit('initialData', { tournaments, teams });
+  });
+
+  socket.on('tournamentUpdate', async (data) => {
     console.log('Tournament update received:', data);
-    io.emit('tournamentUpdate', data);
+    const tournament = await Tournament.findByIdAndUpdate(data._id, data, { new: true, upsert: true }).populate('active_teams sponsors');
+    io.emit('tournamentUpdate', tournament);
   });
 
-  socket.on('teamUpdate', (data) => {
+  socket.on('teamUpdate', async (data) => {
     console.log('Team update received:', data);
-    io.emit('teamUpdate', data);
+    const team = await Team.findByIdAndUpdate(data._id, data, { new: true, upsert: true }).populate('captain members');
+    io.emit('teamUpdate', team);
   });
 
-  socket.on('bracketUpdate', (data) => {
+  socket.on('bracketUpdate', async (data) => {
     console.log('Bracket update received:', data);
-    io.emit('bracketUpdate', data);
+    const tournament = await Tournament.findById(data._id);
+    if (tournament) {
+      tournament.bracket = data.bracket;
+      await tournament.save();
+    }
+    io.emit('bracketUpdate', { _id: data._id, bracket: tournament.bracket });
   });
 
-  socket.on('messageUpdate', (data) => {
+  socket.on('messageUpdate', async (data) => {
     console.log('Message update received:', data);
-    io.emit('messageUpdate', data);
+    const tournament = await Tournament.findById(data._id);
+    if (tournament) {
+      tournament.messages = data.messages || [];
+      await tournament.save();
+    }
+    io.emit('messageUpdate', { _id: data._id, messages: tournament.messages });
   });
 
-  socket.on('scheduleUpdate', (data) => {
+  socket.on('scheduleUpdate', async (data) => {
     console.log('Schedule update received:', data);
-    io.emit('scheduleUpdate', data);
+    const tournament = await Tournament.findById(data._id);
+    if (tournament) {
+      tournament.schedule = data.schedule || [];
+      await tournament.save();
+    }
+    io.emit('scheduleUpdate', { _id: data._id, schedule: tournament.schedule });
+  });
+
+  socket.on('donate', async (data) => {
+    console.log('Donation received:', data);
+    const tournament = await Tournament.findById(data.tournamentId);
+    if (tournament) {
+      tournament.current_funds += Number(data.amount);
+      await tournament.save();
+      io.emit('tournamentUpdate', tournament);
+    }
   });
 });
 
 const PORT = 3001;
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT} with WebSocket support`);
-  // Initialize test data (optional, remove in production)
   const initData = async () => {
     try {
       await User.findOneAndUpdate({ username: 'admin' }, { username: 'admin', role: 'organizer' }, { upsert: true });
